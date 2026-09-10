@@ -126,6 +126,64 @@ class LangGraphRunTracker:
         """Call after you've actually applied a repaired input and resumed locally."""
         self.client.consume_resume(self.run_id)
 
+    def resume_graph_native(self, compiled_graph: Any, state_updates: dict[str, Any] | None = None) -> Any:
+        """
+        Resumes a LangGraph graph via ITS OWN checkpointer, so already-
+        succeeded nodes are genuinely not re-executed - not just not
+        double-recorded on Resumate's side, but never actually re-run by
+        LangGraph at all. Verified against a real installed LangGraph
+        (see doc.md 2.18): a node BEFORE the failure point executes
+        exactly once total across a fail-then-resume cycle; only the
+        failed node itself re-executes.
+
+        REQUIRES: `compiled_graph` was `graph.compile(checkpointer=...)`'d
+        with a real LangGraph checkpointer (e.g.
+        `langgraph.checkpoint.memory.MemorySaver` for a single process,
+        a durable store for crash recovery), and the ORIGINAL failed
+        `invoke()` call used `config={"configurable": {"thread_id":
+        self.run_id}}` - this method reuses that same thread_id.
+
+        Internally calls resume_from_last_failure() (fetches the resume
+        point, positions this tracker's step index correctly, consumes
+        the pending instruction), then:
+          - if `state_updates` is given, applies exactly that via
+            `compiled_graph.update_state()` before resuming - use this
+            when you know how to translate the repair into your own
+            State schema.
+          - otherwise, if the server's repaired_input is the special
+            ledger-confirmed-receipt marker (`resumate_confirmed: True`
+            - see resumate_sdk.ledger), `state_updates` is REQUIRED:
+            raises ValueError rather than guessing how to map
+            `confirmed_output` onto your State fields, since only you
+            know that schema.
+          - otherwise, applies the server's repaired_input as-is (works
+            when its keys already match your State's field names - the
+            common case for e.g. {"timeout_seconds": 30}).
+
+        Then calls `compiled_graph.invoke(None, config=...)` -
+        LangGraph's own engine resumes from its last checkpoint. Returns
+        the graph's final state.
+        """
+        repaired_input = self.resume_from_last_failure()
+
+        if repaired_input and repaired_input.get("resumate_confirmed") and state_updates is None:
+            raise ValueError(
+                "The server confirmed this step's side effect already completed via an "
+                "agent-ledger receipt (resumate_confirmed=True), but no state_updates was "
+                "given to tell native resume how to apply "
+                "repaired_input['confirmed_output'] to your graph's State schema. Pass "
+                "state_updates explicitly, e.g. "
+                "state_updates={'my_state_field': repaired_input['confirmed_output']}."
+            )
+        if state_updates is None and repaired_input:
+            state_updates = repaired_input
+
+        config = {"configurable": {"thread_id": self.run_id}}
+        if state_updates:
+            compiled_graph.update_state(config, state_updates)
+
+        return compiled_graph.invoke(None, config=config)
+
     def resume_from_last_failure(self) -> dict[str, Any] | None:
         """
         Call this on a FRESH tracker when you're about to resume a run

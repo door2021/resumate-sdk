@@ -33,28 +33,47 @@ tracker.mark_run_succeeded()
 If a node raises, the exception is reported to the server and re-raised
 (Resumate records failures, it doesn't swallow them).
 
-## Resuming after a failure
+## Resuming after a failure — two ways
+
+**Recommended: native resume.** Compile your graph with a real LangGraph
+checkpointer and use `resume_graph_native()` — LangGraph's own execution
+engine resumes from its last checkpoint, so already-succeeded nodes are
+genuinely not re-executed (verified against real LangGraph — see the main
+repo's doc.md section 2.18):
+
+```python
+from langgraph.checkpoint.memory import MemorySaver
+
+tracker = LangGraphRunTracker(client, agent_name="research_agent", run_id=thread_id)
+config = {"configurable": {"thread_id": thread_id}}
+app = graph.compile(checkpointer=MemorySaver())  # or a durable store for crash recovery
+
+try:
+    app.invoke(initial_state, config=config)
+except Exception:
+    result = tracker.resume_graph_native(app)  # applies the repair via graph.update_state(),
+                                                 # then invoke(None, config) - LangGraph resumes natively
+```
+
+If the repair is the ledger-confirmed-receipt case (see below), you must
+tell `resume_graph_native()` how to map `confirmed_output` onto your own
+State schema via `state_updates=` — it raises `ValueError` rather than
+guessing:
+```python
+tracker.resume_graph_native(app, state_updates={"charge_result": repaired_input["confirmed_output"]})
+```
+
+**Manual/lower-level: `resume_from_last_failure()`.** Still available for
+when you don't want to compile with a checkpointer, or need to invoke
+only specific remaining node(s) yourself:
 ```python
 tracker = LangGraphRunTracker(client, agent_name="research_agent", run_id=thread_id)
 repaired_input = tracker.resume_from_last_failure()
 timeout = (repaired_input or {}).get("timeout_seconds", DEFAULT_TIMEOUT)
-
 # Invoke ONLY the node(s) that still need to run, starting from the
-# failed step - NOT the whole graph from scratch. See the important
-# limitation below.
+# failed step - NOT the whole graph from scratch, unless you're using
+# resume_graph_native() above, which handles this correctly for you.
 ```
-
-**Important limitation:** `resume_from_last_failure()` tells you *where*
-to resume from and *what* repaired input to use - it does NOT make
-LangGraph itself skip re-running already-succeeded nodes. Calling
-`graph.invoke(...)` on the whole compiled graph again will make LangGraph
-re-execute every earlier node (Resumate won't double-record those steps,
-but your own node code - and any LLM/tool calls in it - runs again). To
-actually avoid re-paying for completed work, invoke only the remaining
-node(s) yourself, or integrate with LangGraph's own checkpointer
-(`MemorySaver`/`thread_id`/interrupts) so LangGraph's execution engine
-resumes mid-graph on its own - that deeper integration isn't built by
-this SDK yet.
 
 ## Preventing duplicate side effects (`resumate_sdk.ledger`)
 
@@ -101,20 +120,23 @@ fact.
 
 ## Status
 Real retry/backoff/fail-open handling — see `client.py` and `exceptions.py`.
-`resume_from_last_failure()` replaces manually poking `tracker._step_index`
-(verified against a real live server + real LangGraph run) — but read its
-docstring/the limitation above before relying on it: it does not make
-LangGraph skip re-executing already-succeeded nodes on its own.
-`resumate_sdk.ledger` (optional `[ledger]` extra) was verified against a
-real installed copy of `agent-ledger`, including a full end-to-end run
-through a live Django server confirming a simulated "Stripe charge" fires
-exactly once across a failure-and-resume cycle - see the main repo's
-doc.md section 2.17.
-Test suite: 13 tests covering retry recovery, fail-open, the
+`resume_graph_native()` closes the real-LangGraph-resume gap — verified
+against an installed LangGraph directly: nodes before the failure point
+execute exactly once total across a fail-then-resume cycle, confirmed
+end-to-end against a live server with an auto-generated repair. Use it in
+preference to `resume_from_last_failure()`'s manual node-by-node approach
+unless you have a specific reason not to (e.g. not compiling with a
+checkpointer). `resumate_sdk.ledger` (optional `[ledger]` extra) was
+verified against a real installed copy of `agent-ledger`, including a full
+end-to-end run through a live Django server confirming a simulated
+"Stripe charge" fires exactly once across a failure-and-resume cycle —
+see the main repo's doc.md sections 2.17-2.18.
+Test suite: 16 tests covering retry recovery, fail-open, the
 original-exception-always-wins guarantee, fail-fast on non-retryable
 errors, `resume_from_last_failure()`'s two paths, `.side_effect_receipt`
-propagation through `track()`, and the ledger module's real dedup
-behavior — run with:
+propagation through `track()`, the ledger module's real dedup behavior,
+and native resume's no-re-execution guarantee against a real LangGraph
+graph — run with:
 
     pip install -e ".[dev]"
     python -m pytest tests/ -v
