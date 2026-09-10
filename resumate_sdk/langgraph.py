@@ -42,6 +42,22 @@ class LangGraphRunTracker:
         self._step_index = 0
 
     def track(self, step_name: str) -> Callable:
+        """
+        If your node's code executed a tool call through
+        resumate_sdk.ledger.run_idempotent() and later raises (e.g. the
+        call succeeded but something afterward crashed), attach the
+        resulting receipt to the exception as `.side_effect_receipt`
+        before raising it - this decorator picks it up (via getattr, no
+        specific exception class required) and reports it, so the server
+        knows not to blindly retry a side effect that already happened:
+
+            try:
+                result, receipt = run_idempotent(ledger, self.run_id, "stripe.charge", args, do_charge)
+            except SomeParsingError as exc:
+                exc.side_effect_receipt = receipt  # only if you have one to attach
+                raise
+        """
+
         def decorator(fn: Callable) -> Callable:
             @functools.wraps(fn)
             def wrapped(state: Any, *args, **kwargs):
@@ -64,6 +80,7 @@ class LangGraphRunTracker:
                             step_name=step_name,
                             status="failed",
                             error={"type": type(exc).__name__, "message": str(exc)},
+                            side_effect_receipt=getattr(exc, "side_effect_receipt", None),
                         )
                     except Exception:
                         logger.exception(
@@ -122,9 +139,15 @@ class LangGraphRunTracker:
         Usage:
             tracker = LangGraphRunTracker(client, agent_name=..., run_id=run_id)
             repaired_input = tracker.resume_from_last_failure()
-            timeout = (repaired_input or {}).get("timeout_seconds", DEFAULT_TIMEOUT)
-            # ...now call ONLY the node(s) that still need to run, wrapped
-            # with .track() as usual, starting from the failed step onward.
+            if repaired_input and repaired_input.get("resumate_confirmed"):
+                # The server confirmed (via an agent-ledger receipt) that
+                # this step's side effect already happened - do NOT
+                # re-invoke the tool. Use the confirmed result directly.
+                output = repaired_input["confirmed_output"]
+            else:
+                timeout = (repaired_input or {}).get("timeout_seconds", DEFAULT_TIMEOUT)
+                # ...now call ONLY the node(s) that still need to run, wrapped
+                # with .track() as usual, starting from the failed step onward.
 
         WHAT THIS DOES NOT DO, READ BEFORE RELYING ON IT: this only tells
         you WHERE to resume from and WHAT repaired input to use - it does

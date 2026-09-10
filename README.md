@@ -56,16 +56,65 @@ node(s) yourself, or integrate with LangGraph's own checkpointer
 resumes mid-graph on its own - that deeper integration isn't built by
 this SDK yet.
 
+## Preventing duplicate side effects (`resumate_sdk.ledger`)
+
+Install with `pip install "resumate-sdk[ledger]"` (pulls in `agent-ledger`,
+a real third-party idempotency library - not something Resumate built).
+Wrap any side-effecting tool call so a retry can never fire it twice:
+
+```python
+from resumate_sdk.ledger import default_ledger, run_idempotent
+
+ledger = default_ledger()  # in-memory, single-worker; see run_idempotent's
+                             # docstring for durable/multi-worker options
+
+@tracker.track("Tool: stripe_charge")
+def charge_node(state):
+    result, receipt = run_idempotent(
+        ledger, tracker.run_id, "stripe.charge", {"amount": 50, "customer": "cus_1"},
+        lambda: stripe.Charge.create(amount=50, customer="cus_1"),
+    )
+    if something_after_the_charge_fails:
+        exc = SomeError("parsing crashed after the charge went through")
+        exc.side_effect_receipt = receipt  # tells the server not to blindly retry
+        raise exc
+    return result
+```
+
+If the step then fails, `track()` picks up `.side_effect_receipt` off the
+exception automatically and reports it. If the receipt shows the charge
+actually succeeded, the Resumate server resolves the step via the
+confirmed result instead of proposing a retry that could double-charge -
+check for this on resume:
+
+```python
+repaired_input = tracker.resume_from_last_failure()
+if repaired_input and repaired_input.get("resumate_confirmed"):
+    output = repaired_input["confirmed_output"]  # do NOT re-run the tool call
+```
+
+**Why this lives here, not on the Resumate server:** an idempotency ledger
+has to wrap actual tool execution to prevent a duplicate call - only your
+own process ever executes that call, so this is the only place real
+protection can live. The server can only ever consult a receipt after the
+fact.
+
 ## Status
 Real retry/backoff/fail-open handling — see `client.py` and `exceptions.py`.
 `resume_from_last_failure()` replaces manually poking `tracker._step_index`
 (verified against a real live server + real LangGraph run) — but read its
 docstring/the limitation above before relying on it: it does not make
 LangGraph skip re-executing already-succeeded nodes on its own.
-Test suite: 7 tests covering retry recovery, fail-open, the
+`resumate_sdk.ledger` (optional `[ledger]` extra) was verified against a
+real installed copy of `agent-ledger`, including a full end-to-end run
+through a live Django server confirming a simulated "Stripe charge" fires
+exactly once across a failure-and-resume cycle - see the main repo's
+doc.md section 2.17.
+Test suite: 13 tests covering retry recovery, fail-open, the
 original-exception-always-wins guarantee, fail-fast on non-retryable
-errors, and `resume_from_last_failure()`'s two paths (repair pending vs
-nothing to consume) — run with:
+errors, `resume_from_last_failure()`'s two paths, `.side_effect_receipt`
+propagation through `track()`, and the ledger module's real dedup
+behavior — run with:
 
     pip install -e ".[dev]"
     python -m pytest tests/ -v

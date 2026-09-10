@@ -115,6 +115,7 @@ class ResumateClient:
         output: dict[str, Any] | None = None,
         error: dict[str, str] | None = None,
         run_status: str | None = None,
+        side_effect_receipt: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """
         Report a step's outcome. FAIL-OPEN BY DEFAULT: if the Resumate API
@@ -124,6 +125,15 @@ class ResumateClient:
         down. Set fail_open=False on the client if you'd rather this raise
         ResumateAPIError instead (e.g. you want checkpointing gaps to be a
         hard stop, not a silent miss).
+
+        `side_effect_receipt`: pass the receipt dict returned by
+        resumate_sdk.ledger.run_idempotent() when this step's tool call
+        was executed through an idempotency ledger. If the step ends up
+        reporting status="failed" but the receipt shows the underlying
+        side effect actually succeeded, the Resumate server will resume
+        with the confirmed result instead of generating a retry that
+        could duplicate the effect - see apps.repairs.services in the
+        main repo for the server-side half of this.
         """
         payload = {
             "agent_name": agent_name,
@@ -134,6 +144,7 @@ class ResumateClient:
             "output": output,
             "error": error,
             "run_status": run_status,
+            "side_effect_receipt": side_effect_receipt,
         }
         try:
             resp = self._request_with_retry("POST", "/api/v1/checkpoints/", json=payload)

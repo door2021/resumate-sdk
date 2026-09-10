@@ -129,3 +129,54 @@ def test_resume_from_last_failure_does_not_consume_when_nothing_pending():
     assert repaired_input is None
     assert tracker._step_index == 3
     assert calls == ["GET"], "must not call consume when there's nothing to consume"
+
+
+def test_side_effect_receipt_on_exception_is_reported_to_the_server():
+    """A .side_effect_receipt attached to an exception must be included
+    in the failure report the server receives."""
+    captured = {}
+
+    def handler(request):
+        import json
+
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"step_recorded": True, "run_status": "failed", "resume": {}})
+
+    client = _client(handler)
+    tracker = LangGraphRunTracker(client, agent_name="a", run_id="r7")
+
+    receipt = {"tool": "stripe.charge", "idem_key": "abc123", "status": "succeeded", "result": {"id": "ch_1"}}
+
+    @tracker.track("charge_customer")
+    def node(state):
+        exc = ConnectionError("response parsing crashed after the charge went through")
+        exc.side_effect_receipt = receipt
+        raise exc
+
+    with pytest.raises(ConnectionError):
+        node({})
+
+    assert captured["body"]["side_effect_receipt"] == receipt
+
+
+def test_no_side_effect_receipt_reports_none():
+    """The common case - no ledger involved - must not send a bogus receipt."""
+    captured = {}
+
+    def handler(request):
+        import json
+
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"step_recorded": True, "run_status": "failed", "resume": {}})
+
+    client = _client(handler)
+    tracker = LangGraphRunTracker(client, agent_name="a", run_id="r8")
+
+    @tracker.track("plain_node")
+    def node(state):
+        raise ValueError("ordinary failure, no ledger involved")
+
+    with pytest.raises(ValueError):
+        node({})
+
+    assert captured["body"]["side_effect_receipt"] is None
