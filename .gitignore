@@ -6,3 +6,5 @@ __pycache__
 .gitignore
 *.pyc
 .DS_Store
+.pytest_cache
+.gitignore

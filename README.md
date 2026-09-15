@@ -81,11 +81,22 @@ Install with `pip install "resumate-sdk[ledger]"` (pulls in `agent-ledger`,
 a real third-party idempotency library - not something Resumate built).
 Wrap any side-effecting tool call so a retry can never fire it twice:
 
-```python
-from resumate_sdk.ledger import default_ledger, run_idempotent
+**Use a durable store for anything you actually care about not double-firing.**
+`default_ledger()` (in-memory) is fine for local testing, but it does NOT
+survive a process crash - tested directly: a crash between the side effect
+succeeding and the ledger recording it, followed by a process restart with
+a fresh `default_ledger()`, re-fires the side effect. For anything real
+(payments, emails, database writes), point `EffectLedger` at your own
+durable store instead:
 
-ledger = default_ledger()  # in-memory, single-worker; see run_idempotent's
-                             # docstring for durable/multi-worker options
+```python
+from agent_ledger import EffectLedger, EffectLedgerOptions
+from agent_ledger.stores.postgres import PostgresStore
+from resumate_sdk.ledger import run_idempotent
+# pool = your own AsyncConnectionPool (psycopg_pool), any Postgres you run -
+# does not need to be the same database your agent otherwise uses.
+
+ledger = EffectLedger(EffectLedgerOptions(store=PostgresStore(pool)))
 
 @tracker.track("Tool: stripe_charge")
 def charge_node(state):
@@ -99,6 +110,22 @@ def charge_node(state):
         raise exc
     return result
 ```
+
+With a durable store, a crash right after the side effect succeeds (before
+the ledger commits that fact) is safe - the effect is claimed *before* the
+handler runs, so a crash mid-flight leaves it stuck rather than duplicated;
+a retry with the same key waits/times out rather than re-firing.
+
+**A real limitation, stated plainly rather than glossed over:** a network
+timeout (request sent, response never came back - so you genuinely don't
+know if it landed) is currently classified the same as a confirmed
+rejection - there's no separate "unknown, go check manually" state yet.
+Tested directly: a timed-out call gets marked `failed` and permanently
+blocks retry on that idempotency key, whether or not the side effect
+actually happened. This is safe in the narrow sense (no double-fire), but
+it means "failed" in your dashboard doesn't always mean "definitely didn't
+happen" - for a timed-out side effect, verify with the provider directly
+before assuming it didn't land.
 
 If the step then fails, `track()` picks up `.side_effect_receipt` off the
 exception automatically and reports it. If the receipt shows the charge
