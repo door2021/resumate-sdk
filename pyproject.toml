@@ -1,13 +1,13 @@
 [project]
 name = "resumate-sdk"
-version = "0.1.0"
-description = "Checkpoint, repair, and resume your LangGraph agents with Resumate"
+version = "0.2.0"
+description = "Checkpoint, repair, and resume your LangGraph agents with Resumate, with a safe effect ledger"
 requires-python = ">=3.10"
 dependencies = ["httpx>=0.28"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "langgraph>=0.2"]
-ledger = ["agent-ledger>=0.2"]
+postgres = ["psycopg[binary]>=3.1"]
 
 [build-system]
 requires = ["hatchling"]

@@ -116,6 +116,8 @@ class ResumateClient:
         error: dict[str, str] | None = None,
         run_status: str | None = None,
         side_effect_receipt: dict[str, Any] | None = None,
+        effect_type: str | None = None,
+        validator_registered: bool | None = None,
     ) -> dict[str, Any]:
         """
         Report a step's outcome. FAIL-OPEN BY DEFAULT: if the Resumate API
@@ -126,14 +128,21 @@ class ResumateClient:
         ResumateAPIError instead (e.g. you want checkpointing gaps to be a
         hard stop, not a silent miss).
 
-        `side_effect_receipt`: pass the receipt dict returned by
-        resumate_sdk.ledger.run_idempotent() when this step's tool call
-        was executed through an idempotency ledger. If the step ends up
-        reporting status="failed" but the receipt shows the underlying
-        side effect actually succeeded, the Resumate server will resume
-        with the confirmed result instead of generating a retry that
-        could duplicate the effect - see apps.repairs.services in the
-        main repo for the server-side half of this.
+        `side_effect_receipt`: the receipt returned by
+        resumate_sdk.ledger.Ledger.run() when this step's tool call went
+        through the ledger (it is also attached to any exception the ledger
+        raises, as `.side_effect_receipt`). Its status is one of processing,
+        succeeded, failed or unknown. If the receipt shows the effect
+        succeeded, the server resumes with the recorded result instead of
+        retrying.
+
+        `effect_type`: none, repeat_safe, reversible or irreversible. Leave it
+        out and the server treats the step as irreversible (the safe
+        default), which means most failures escalate to a person.
+
+        `validator_registered`: True when you registered a validator for
+        this step, so the server may ask you to check whether the effect
+        happened (rule 3 of the recovery gate) instead of escalating.
         """
         payload = {
             "agent_name": agent_name,
@@ -146,6 +155,10 @@ class ResumateClient:
             "run_status": run_status,
             "side_effect_receipt": side_effect_receipt,
         }
+        if effect_type is not None:
+            payload["effect_type"] = effect_type
+        if validator_registered is not None:
+            payload["validator_registered"] = validator_registered
         try:
             resp = self._request_with_retry("POST", "/api/v1/checkpoints/", json=payload)
             return resp.json()
@@ -165,6 +178,27 @@ class ResumateClient:
     def get_resume(self, run_external_id: str) -> dict[str, Any]:
         resp = self._request_with_retry("GET", f"/api/v1/runs/{run_external_id}/resume/")
         return resp.json()
+
+    def report_revalidation(self, run_external_id: str, step_index: int, result: str) -> dict[str, Any]:
+        """
+        Answer the server's "revalidate" request for a step: `result` is
+        "effect_done", "effect_absent" or "unclear". The server runs its gate
+        again and returns the new run status and resume point. FAIL-OPEN like
+        report_step: if the server cannot be reached, returns
+        {"reported": False, ...} and the step simply stays escalated/waiting.
+        """
+        try:
+            resp = self._request_with_retry(
+                "POST",
+                f"/api/v1/runs/{run_external_id}/revalidation/",
+                json={"step_index": step_index, "result": result},
+            )
+            return resp.json()
+        except ResumateAPIUnavailable as exc:
+            if self.fail_open:
+                logger.error("resumate_sdk: could not report revalidation for run %s: %s", run_external_id, exc)
+                return {"reported": False, "error": str(exc)}
+            raise
 
     def consume_resume(self, run_external_id: str) -> None:
         self._request_with_retry("POST", f"/api/v1/runs/{run_external_id}/resume/consume/")
